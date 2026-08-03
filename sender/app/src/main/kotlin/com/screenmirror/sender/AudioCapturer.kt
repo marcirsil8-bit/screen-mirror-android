@@ -5,35 +5,47 @@ import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
-import android.net.InetAddresses
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
+import android.media.projection.MediaProjection
+import android.util.Log
+import java.io.DataOutputStream
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.nio.ByteBuffer
 
-class AudioCapturer(private val port: Int) {
+class AudioCapturer(
+    private val mediaProjection: MediaProjection,
+    private val targetIp: String,
+    private val targetPort: Int
+) {
     companion object {
+        private const val TAG = "AudioCapturer"
         private const val SAMPLE_RATE = 44100
+        private const val MIME_TYPE = "audio/mp4a-latm"
+        private const val BIT_RATE = 128_000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_STEREO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val MIME_TYPE = "audio/mp4a-latm" // AAC
-        private const val BIT_RATE = 128_000
     }
 
     private var audioRecord: AudioRecord? = null
     private var mediaCodec: MediaCodec? = null
     private var isRunning = false
-    private var udpSocket: DatagramSocket? = null
+    private var socket: Socket? = null
+    private var outputStream: DataOutputStream? = null
     private var recordThread: Thread? = null
     private var encodeThread: Thread? = null
 
-    private var minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
-    private var bufferSize = minBufferSize * 2
+    private val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
 
-    private var targetHost: String? = null
-
-    fun setTargetHost(host: String) {
-        targetHost = host
+    fun connect() {
+        try {
+            socket = Socket()
+            socket?.connect(InetSocketAddress(targetIp, targetPort), 5000)
+            socket?.tcpNoDelay = true
+            outputStream = DataOutputStream(socket?.getOutputStream())
+            Log.d(TAG, "Audio connected to $targetIp:$targetPort")
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio connect failed: ${e.message}")
+        }
     }
 
     fun start() {
@@ -42,31 +54,50 @@ class AudioCapturer(private val port: Int) {
             val format = MediaFormat.createAudioFormat(MIME_TYPE, SAMPLE_RATE, 2).apply {
                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
                 setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE)
-                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, bufferSize)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, minBufferSize * 2)
             }
 
             mediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             mediaCodec?.start()
 
-            // Setup AudioRecord
-            audioRecord = AudioRecord(
-                android.media.MediaRecorder.AudioSource.MIC,
-                SAMPLE_RATE,
-                CHANNEL_CONFIG,
-                AUDIO_FORMAT,
-                bufferSize
-            )
+            // Use MediaProjection to capture system audio (Android 10+)
+            val audioConfig = android.media.AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                .apply {
+                    addMatchingUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    addMatchingUsage(android.media.AudioAttributes.USAGE_GAME)
+                    addMatchingUsage(android.media.AudioAttributes.USAGE_UNKNOWN)
+                }
+                .build()
+
+            audioRecord = AudioRecord.Builder()
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AUDIO_FORMAT)
+                        .setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(CHANNEL_CONFIG)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBufferSize * 2)
+                .setAudioPlaybackCaptureConfig(audioConfig)
+                .build()
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                throw RuntimeException("AudioRecord init failed")
+                Log.e(TAG, "AudioRecord init failed - falling back to MIC")
+                // Fallback to MIC if playback capture not available
+                audioRecord = AudioRecord(
+                    android.media.MediaRecorder.AudioSource.MIC,
+                    SAMPLE_RATE,
+                    CHANNEL_CONFIG,
+                    AUDIO_FORMAT,
+                    minBufferSize * 2
+                )
             }
 
             audioRecord?.startRecording()
-            udpSocket = DatagramSocket()
             isRunning = true
 
-            // Thread to feed audio into encoder
+            // Feed audio into encoder
             recordThread = Thread {
                 val buffer = ByteArray(minBufferSize)
                 while (isRunning) {
@@ -86,7 +117,7 @@ class AudioCapturer(private val port: Int) {
                 }
             }
 
-            // Thread to read encoded audio and send via UDP
+            // Read encoded audio and send
             encodeThread = Thread {
                 val bufferInfo = MediaCodec.BufferInfo()
                 while (isRunning) {
@@ -107,41 +138,28 @@ class AudioCapturer(private val port: Int) {
 
             recordThread?.start()
             encodeThread?.start()
+            Log.d(TAG, "Audio capturer started")
         } catch (e: Exception) {
+            Log.e(TAG, "Audio start failed: ${e.message}")
             e.printStackTrace()
         }
     }
 
     private fun sendAudio(data: ByteArray, flags: Int, pts: Long) {
         try {
-            val host = targetHost ?: "255.255.255.255"
-            val address = InetAddress.getByName(host)
-            
-            // Header: [magic(2)][flags(4)][pts(8)][size(4)][data]
-            val packet = ByteArray(2 + 4 + 8 + 4 + data.size)
-            packet[0] = 0x41 // 'A'
-            packet[1] = 0x55 // 'U'
-            
-            packet[2] = (flags shr 24).toByte()
-            packet[3] = (flags shr 16).toByte()
-            packet[4] = (flags shr 8).toByte()
-            packet[5] = flags.toByte()
-            
-            val ptsBytes = ByteBuffer.allocate(8).putLong(pts).array()
-            System.arraycopy(ptsBytes, 0, packet, 6, 8)
-            
-            val size = data.size
-            packet[14] = (size shr 24).toByte()
-            packet[15] = (size shr 16).toByte()
-            packet[16] = (size shr 8).toByte()
-            packet[17] = size.toByte()
-            
-            System.arraycopy(data, 0, packet, 18, data.size)
-            
-            val dp = DatagramPacket(packet, packet.size, address, port)
-            udpSocket?.send(dp)
+            val out = outputStream ?: return
+            // Frame format: [type=1 byte 'A'][flags=4][pts=8][size=4][data]
+            synchronized(out) {
+                out.writeByte(0x41) // 'A' for audio
+                out.writeInt(flags)
+                out.writeLong(pts)
+                out.writeInt(data.size)
+                out.write(data)
+                out.flush()
+            }
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e(TAG, "Send audio failed: ${e.message}")
+            isRunning = false
         }
     }
 
@@ -154,12 +172,14 @@ class AudioCapturer(private val port: Int) {
             audioRecord?.release()
             mediaCodec?.stop()
             mediaCodec?.release()
-            udpSocket?.close()
+            outputStream?.close()
+            socket?.close()
         } catch (e: Exception) {
             e.printStackTrace()
         }
         audioRecord = null
         mediaCodec = null
-        udpSocket = null
+        socket = null
+        outputStream = null
     }
 }

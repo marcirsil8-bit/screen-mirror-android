@@ -2,14 +2,11 @@ package com.screenmirror.receiver
 
 import android.media.MediaCodec
 import android.media.MediaFormat
-import android.os.Handler
-import android.os.HandlerThread
 import android.util.Log
-import android.view.Surface
 import android.view.SurfaceView
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.nio.ByteBuffer
+import java.io.DataInputStream
+import java.net.ServerSocket
+import java.net.Socket
 import java.util.concurrent.LinkedBlockingQueue
 
 class StreamReceiver(
@@ -17,77 +14,77 @@ class StreamReceiver(
     private val surfaceView: SurfaceView
 ) {
     companion object {
+        private const val TAG = "StreamReceiver"
         private const val MIME_TYPE = "video/avc"
-        private const val MAX_QUEUE_SIZE = 60
+        private const val MAX_QUEUE_SIZE = 30
     }
 
     private var mediaCodec: MediaCodec? = null
-    private var udpSocket: DatagramSocket? = null
+    private var serverSocket: ServerSocket? = null
+    private var clientSocket: Socket? = null
     private var isRunning = false
     private var receiveThread: Thread? = null
     private var decodeThread: Thread? = null
     private val frameQueue = LinkedBlockingQueue<FrameData>(MAX_QUEUE_SIZE)
-    private var handlerThread: HandlerThread? = null
-    private var handler: Handler? = null
+    private var hasFormat = false
 
     data class FrameData(val data: ByteArray, val flags: Int, val pts: Long)
 
     fun start() {
         isRunning = true
 
-        handlerThread = HandlerThread("StreamReceiverThread")
-        handlerThread?.start()
-        handler = Handler(handlerThread!!.looper)
-
-        // Configure decoder once we get SPS/PPS (first frame)
+        // TCP server thread - accepts connection and receives frames
         receiveThread = Thread {
             try {
-                udpSocket = DatagramSocket(port)
-                udpSocket?.receiveBufferSize = 1024 * 1024
-                
+                serverSocket = ServerSocket(port)
+                Log.d(TAG, "Listening on port $port")
+
                 while (isRunning) {
-                    val buffer = ByteArray(1024 * 64) // 64KB max frame size
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    udpSocket?.receive(packet)
-
-                    // Parse header
-                    if (packet.length < 18) continue
-                    if (packet.data[0] != 0x53.toByte() || packet.data[1] != 0x4D.toByte()) continue
-
-                    val flags = ((packet.data[2].toInt() and 0xFF) shl 24) or
-                                ((packet.data[3].toInt() and 0xFF) shl 16) or
-                                ((packet.data[4].toInt() and 0xFF) shl 8) or
-                                (packet.data[5].toInt() and 0xFF)
+                    val socket = serverSocket?.accept() ?: break
+                    Log.d(TAG, "Sender connected: ${socket.inetAddress}")
+                    clientSocket = socket
                     
-                    val pts = ByteBuffer.wrap(packet.data, 6, 8).long
-                    val size = ((packet.data[14].toInt() and 0xFF) shl 24) or
-                               ((packet.data[15].toInt() and 0xFF) shl 16) or
-                               ((packet.data[16].toInt() and 0xFF) shl 8) or
-                               (packet.data[17].toInt() and 0xFF)
-
-                    if (size <= 0 || size > packet.length - 18) continue
-
-                    val data = ByteArray(size)
-                    System.arraycopy(packet.data, 18, data, 0, size)
-
-                    val frame = FrameData(data, flags, pts)
+                    val input = DataInputStream(socket.getInputStream())
                     
-                    // Non-blocking add - drop oldest if queue full
-                    if (!frameQueue.offer(frame)) {
-                        frameQueue.poll()
-                        frameQueue.offer(frame)
-                    }
-
-                    // Try to init decoder on first key frame
-                    if (mediaCodec == null && (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0)) {
-                        initDecoder(data)
+                    while (isRunning && !socket.isClosed) {
+                        try {
+                            // Read frame header: [type][flags][pts][size]
+                            val type = input.readByte()
+                            if (type != 0x56.toByte()) continue // 'V' for video
+                            
+                            val flags = input.readInt()
+                            val pts = input.readLong()
+                            val size = input.readInt()
+                            
+                            if (size <= 0 || size > 10 * 1024 * 1024) continue
+                            
+                            val data = ByteArray(size)
+                            input.readFully(data)
+                            
+                            val frame = FrameData(data, flags, pts)
+                            
+                            // Handle codec config (SPS/PPS)
+                            if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                                initDecoder(data)
+                            } else {
+                                // Drop old frames if queue full
+                                if (!frameQueue.offer(frame)) {
+                                    frameQueue.poll()
+                                    frameQueue.offer(frame)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            if (isRunning) Log.e(TAG, "Receive error: ${e.message}")
+                            break
+                        }
                     }
                 }
             } catch (e: Exception) {
-                if (isRunning) e.printStackTrace()
+                if (isRunning) Log.e(TAG, "Server error: ${e.message}")
             }
         }
 
+        // Decode thread
         decodeThread = Thread {
             while (isRunning) {
                 val frame = frameQueue.poll() ?: continue
@@ -105,18 +102,14 @@ class StreamReceiver(
                     }
 
                     val bufferInfo = MediaCodec.BufferInfo()
-                    val outputIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, 10000) ?: -1
-                    when (outputIndex) {
-                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            Log.d("StreamReceiver", "Format changed")
-                        }
-                        in 0..Int.MAX_VALUE -> {
-                            // Render to surface
-                            mediaCodec?.releaseOutputBuffer(outputIndex, true)
-                        }
+                    var outputIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, 10000) ?: -1
+                    while (outputIndex >= 0) {
+                        // Render to surface
+                        mediaCodec?.releaseOutputBuffer(outputIndex, true)
+                        outputIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, 0) ?: -1
                     }
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Log.e(TAG, "Decode error: ${e.message}")
                 }
             }
         }
@@ -125,18 +118,40 @@ class StreamReceiver(
         decodeThread?.start()
     }
 
-    private fun initDecoder(spsData: ByteArray) {
+    private fun initDecoder(csdData: ByteArray) {
+        if (mediaCodec != null) return
+        
         try {
-            // Extract SPS/PPS from the H.264 NAL units in the keyframe
-            val format = MediaFormat.createVideoFormat(MIME_TYPE, 1920, 1080)
+            // Parse SPS from NAL units to get width/height
+            var width = 1920
+            var height = 1080
+            
+            // Try to find SPS (NAL type 7) and PPS (NAL type 8)
+            val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height)
+            format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(csdData))
             
             mediaCodec = MediaCodec.createDecoderByType(MIME_TYPE)
-            mediaCodec?.configure(format, surfaceView.holder.surface, null, 0)
-            mediaCodec?.start()
             
-            Log.d("StreamReceiver", "Decoder initialized")
+            // Wait for surface to be ready
+            var retries = 0
+            while (surfaceView.holder.surface == null && retries < 50) {
+                Thread.sleep(100)
+                retries++
+            }
+            
+            val surface = surfaceView.holder.surface
+            if (surface != null && surface.isValid) {
+                mediaCodec?.configure(format, surface, null, 0)
+                mediaCodec?.start()
+                hasFormat = true
+                Log.d(TAG, "Decoder initialized with SPS/PPS")
+            } else {
+                Log.e(TAG, "Surface not ready after $retries retries")
+                mediaCodec = null
+            }
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e(TAG, "Init decoder failed: ${e.message}")
+            mediaCodec = null
         }
     }
 
@@ -147,12 +162,13 @@ class StreamReceiver(
             decodeThread?.join(500)
             mediaCodec?.stop()
             mediaCodec?.release()
-            udpSocket?.close()
-            handlerThread?.quitSafely()
+            clientSocket?.close()
+            serverSocket?.close()
         } catch (e: Exception) {
             e.printStackTrace()
         }
         mediaCodec = null
-        udpSocket = null
+        clientSocket = null
+        serverSocket = null
     }
 }

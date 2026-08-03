@@ -1,8 +1,11 @@
 package com.screenmirror.receiver
 
-import android.app.Activity
 import android.content.Context
+import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.util.DisplayMetrics
+import android.view.SurfaceHolder
+import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
@@ -11,30 +14,28 @@ import androidx.appcompat.app.AppCompatActivity
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        private const val DISCOVERY_PORT = 50000
-        private const val STREAM_PORT = 50001
+        private const val VIDEO_PORT = 50001
         private const val AUDIO_PORT = 50002
     }
 
     private var streamReceiver: StreamReceiver? = null
     private var audioReceiver: AudioReceiver? = null
-    private var discoveryBroadcaster: DiscoveryBroadcaster? = null
 
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
     private lateinit var tvStatus: TextView
     private lateinit var tvInfo: TextView
+    private var surfaceReady = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // Fullscreen for TV
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.decorView.systemUiVisibility = (
-            android.view.View.SYSTEM_UI_FLAG_FULLSCREEN or
-            android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-            android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            View.SYSTEM_UI_FLAG_FULLSCREEN or
+            View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         )
 
         btnStart = findViewById(R.id.btnStart)
@@ -43,6 +44,19 @@ class MainActivity : AppCompatActivity() {
         tvInfo = findViewById(R.id.tvInfo)
 
         btnStop.isEnabled = false
+        tvInfo.text = getDeviceInfo()
+
+        val surfaceView = findViewById<android.view.SurfaceView>(R.id.surfaceView)
+        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                surfaceReady = true
+                tvStatus.text = "✅ Pronto - IP acima"
+            }
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                surfaceReady = false
+            }
+        })
 
         btnStart.setOnClickListener {
             startReceiving()
@@ -51,41 +65,43 @@ class MainActivity : AppCompatActivity() {
         btnStop.setOnClickListener {
             stopReceiving()
         }
-
-        tvInfo.text = getDeviceInfo()
     }
 
     private fun getDeviceInfo(): String {
-        val dm = android.util.DisplayMetrics()
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val ip = intToIp(wm.connectionInfo.ipAddress)
+        val dm = DisplayMetrics()
         windowManager.defaultDisplay.getRealMetrics(dm)
-        return "Resolução TV: ${dm.widthPixels}x${dm.heightPixels}\n" +
+        return "📡 IP da TV Box: $ip\n" +
+               "Resolução: ${dm.widthPixels}x${dm.heightPixels}\n" +
                "Android: ${android.os.Build.VERSION.RELEASE}\n" +
-               "Modelo: ${android.os.Build.MODEL}"
+               "Modelo: ${android.os.Build.MODEL}\n\n" +
+               "Digite este IP no celular"
+    }
+
+    private fun intToIp(ip: Int): String {
+        return "${ip and 0xFF}.${(ip shr 8) and 0xFF}.${(ip shr 16) and 0xFF}.${(ip shr 24) and 0xFF}"
     }
 
     private fun startReceiving() {
-        // Start discovery to find sender
-        discoveryBroadcaster = DiscoveryBroadcaster(DISCOVERY_PORT)
-        discoveryBroadcaster?.start()
-
-        // Start video stream receiver
-        streamReceiver = StreamReceiver(STREAM_PORT, findViewById(R.id.surfaceView))
+        val surfaceView = findViewById<android.view.SurfaceView>(R.id.surfaceView)
+        
+        // Start video receiver (TCP server)
+        streamReceiver = StreamReceiver(VIDEO_PORT, surfaceView)
         streamReceiver?.start()
 
-        // Start audio stream receiver
+        // Start audio receiver (TCP server on next port)
         audioReceiver = AudioReceiver(AUDIO_PORT)
         audioReceiver?.start()
 
         btnStart.isEnabled = false
         btnStop.isEnabled = true
-        tvStatus.text = "📡 Aguardando transmissão..."
+        tvStatus.text = "📡 Aguardando conexão..."
     }
 
     private fun stopReceiving() {
-        discoveryBroadcaster?.stop()
         streamReceiver?.stop()
         audioReceiver?.stop()
-        discoveryBroadcaster = null
         streamReceiver = null
         audioReceiver = null
 

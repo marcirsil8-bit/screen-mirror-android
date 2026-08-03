@@ -6,9 +6,10 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Handler
 import android.os.HandlerThread
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
+import android.util.Log
+import java.io.DataOutputStream
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.nio.ByteBuffer
 
 class ScreenEncoder(
@@ -16,13 +17,15 @@ class ScreenEncoder(
     private val width: Int,
     private val height: Int,
     private val dpi: Int,
-    private val streamPort: Int
+    private val targetIp: String,
+    private val targetPort: Int
 ) {
     companion object {
+        private const val TAG = "ScreenEncoder"
         private const val MIME_TYPE = "video/avc"
-        private const val FRAME_RATE = 60
-        private const val I_FRAME_INTERVAL = 2
-        private const val BIT_RATE = 8_000_000
+        private const val FRAME_RATE = 30
+        private const val I_FRAME_INTERVAL = 1
+        private const val BIT_RATE = 6_000_000
     }
 
     private var mediaCodec: MediaCodec? = null
@@ -30,11 +33,23 @@ class ScreenEncoder(
     private var handlerThread: HandlerThread? = null
     private var handler: Handler? = null
     private var isRunning = false
-    private var udpSocket: DatagramSocket? = null
-    private var targetHost: String? = null
+    private var socket: Socket? = null
+    private var outputStream: DataOutputStream? = null
 
-    fun setTargetHost(host: String) {
-        targetHost = host
+    fun connect(): Boolean {
+        return try {
+            Log.d(TAG, "Connecting to $targetIp:$targetPort")
+            socket = Socket()
+            socket?.connect(InetSocketAddress(targetIp, targetPort), 5000)
+            socket?.tcpNoDelay = true
+            socket?.sendBufferSize = 512 * 1024
+            outputStream = DataOutputStream(socket?.getOutputStream())
+            Log.d(TAG, "Connected!")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Connection failed: ${e.message}")
+            false
+        }
     }
 
     fun start() {
@@ -59,8 +74,6 @@ class ScreenEncoder(
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
                 setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
-            setInteger("max-fps", FRAME_RATE)
-            setInteger("repeat-previous-frame-after", 100000)
             setInteger("max-consecutive-bframes", 0)
         }
 
@@ -69,7 +82,26 @@ class ScreenEncoder(
             mediaCodec?.setCallback(object : MediaCodec.Callback() {
                 override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {}
 
-                override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {}
+                override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+                    // Send format info (SPS/PPS) to receiver
+                    try {
+                        val csd0 = format.getByteBuffer("csd-0")
+                        val csd1 = format.getByteBuffer("csd-1")
+                        if (csd0 != null) {
+                            val csd0Data = ByteArray(csd0.remaining())
+                            csd0.get(csd0Data)
+                            sendFrame(csd0Data, MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0)
+                        }
+                        if (csd1 != null) {
+                            val csd1Data = ByteArray(csd1.remaining())
+                            csd1.get(csd1Data)
+                            sendFrame(csd1Data, MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0)
+                        }
+                        Log.d(TAG, "Sent SPS/PPS to receiver")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to send format: ${e.message}")
+                    }
+                }
 
                 override fun onOutputBufferAvailable(
                     codec: MediaCodec,
@@ -82,14 +114,13 @@ class ScreenEncoder(
                         outputBuffer.position(info.offset)
                         outputBuffer.limit(info.offset + info.size)
                         outputBuffer.get(data)
-
                         sendFrame(data, info.flags, info.presentationTimeUs)
                     }
                     codec.releaseOutputBuffer(index, false)
                 }
 
                 override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
-                    e.printStackTrace()
+                    Log.e(TAG, "Codec error: ${e.message}")
                 }
             }, handler!!)
 
@@ -105,41 +136,28 @@ class ScreenEncoder(
             )
 
             isRunning = true
-            udpSocket = DatagramSocket()
+            Log.d(TAG, "Screen encoder started: ${targetWidth}x${targetHeight}")
         } catch (e: Exception) {
+            Log.e(TAG, "Start failed: ${e.message}")
             e.printStackTrace()
         }
     }
 
     private fun sendFrame(data: ByteArray, flags: Int, pts: Long) {
         try {
-            val host = targetHost ?: "255.255.255.255"
-            val address = InetAddress.getByName(host)
-            
-            val packet = ByteArray(2 + 4 + 8 + 4 + data.size)
-            packet[0] = 0x53
-            packet[1] = 0x4D
-            
-            packet[2] = (flags shr 24).toByte()
-            packet[3] = (flags shr 16).toByte()
-            packet[4] = (flags shr 8).toByte()
-            packet[5] = flags.toByte()
-            
-            val ptsBytes = ByteBuffer.allocate(8).putLong(pts).array()
-            System.arraycopy(ptsBytes, 0, packet, 6, 8)
-            
-            val size = data.size
-            packet[14] = (size shr 24).toByte()
-            packet[15] = (size shr 16).toByte()
-            packet[16] = (size shr 8).toByte()
-            packet[17] = size.toByte()
-            
-            System.arraycopy(data, 0, packet, 18, data.size)
-            
-            val dp = DatagramPacket(packet, packet.size, address, streamPort)
-            udpSocket?.send(dp)
+            val out = outputStream ?: return
+            // Frame format: [type=1 byte 'V'][flags=4][pts=8][size=4][data]
+            synchronized(out) {
+                out.writeByte(0x56) // 'V' for video
+                out.writeInt(flags)
+                out.writeLong(pts)
+                out.writeInt(data.size)
+                out.write(data)
+                out.flush()
+            }
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e(TAG, "Send frame failed: ${e.message}")
+            isRunning = false
         }
     }
 
@@ -149,13 +167,15 @@ class ScreenEncoder(
             virtualDisplay?.release()
             mediaCodec?.stop()
             mediaCodec?.release()
-            udpSocket?.close()
+            outputStream?.close()
+            socket?.close()
             handlerThread?.quitSafely()
         } catch (e: Exception) {
             e.printStackTrace()
         }
         virtualDisplay = null
         mediaCodec = null
-        udpSocket = null
+        socket = null
+        outputStream = null
     }
 }

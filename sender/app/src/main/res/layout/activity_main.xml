@@ -14,7 +14,7 @@
         android:textColor="#6C9EFF"
         android:textSize="26sp"
         android:textStyle="bold"
-        android:layout_marginBottom="32dp" />
+        android:layout_marginBottom="24dp" />
 
     <TextView
         android:id="@+id/tvStatus"
@@ -23,7 +23,7 @@
         android:text="⏹️ Parado"
         android:textColor="#FFFFFF"
         android:textSize="20sp"
-        android:layout_marginBottom="24dp" />
+        android:layout_marginBottom="16dp" />
 
     <TextView
         android:id="@+id/tvInfo"
@@ -32,8 +32,29 @@
         android:text=""
         android:textColor="#888888"
         android:textSize="14sp"
-        android:layout_marginBottom="32dp"
+        android:layout_marginBottom="20dp"
         android:lineSpacingExtra="4dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="IP da TV Box:"
+        android:textColor="#AAAAAA"
+        android:textSize="16sp"
+        android:layout_marginBottom="8dp" />
+
+    <EditText
+        android:id="@+id/etIp"
+        android:layout_width="280dp"
+        android:layout_height="56dp"
+        android:hint="ex: 192.168.1.100"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#555555"
+        android:textSize="18sp"
+        android:inputType="text"
+        android:background="#1A1E2E"
+        android:padding="12dp"
+        android:layout_marginBottom="20dp" />
 
     <Button
         android:id="@+id/btnStart"
@@ -43,7 +64,7 @@
         android:textSize="16sp"
         android:background="#4CAF50"
         android:textColor="#FFFFFF"
-        android:layout_marginBottom="16dp" />
+        android:layout_marginBottom="12dp" />
 
     <Button
         android:id="@+id/btnStop"
@@ -57,9 +78,10 @@
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="Conecte o TV Box à mesma rede WiFi"
+        android:text="O TV Box e o celular devem estar\nna mesma rede WiFi"
         android:textColor="#555555"
         android:textSize="13sp"
-        android:layout_marginTop="32dp" />
+        android:layout_marginTop="24dp"
+        android:gravity="center" />
 
 </LinearLayout>

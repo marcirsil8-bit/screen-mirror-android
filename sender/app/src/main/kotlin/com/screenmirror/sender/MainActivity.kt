@@ -1,52 +1,36 @@
-// Sender (Phone) - Screen Mirror Sender
-// Captures screen + audio and streams to TV Box over local network
-
 package com.screenmirror.sender
 
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.util.DisplayMetrics
-import android.view.Surface
-import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.ServerSocket
-import java.net.Socket
-import java.nio.ByteBuffer
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQUEST_CODE_SCREEN_CAPTURE = 1001
-        private const val DISCOVERY_PORT = 50000
-        private const val STREAM_PORT = 50001
-        private const val AUDIO_PORT = 50002
+        private const val SERVER_PORT = 50001
     }
 
     private var mediaProjection: MediaProjection? = null
     private var screenEncoder: ScreenEncoder? = null
     private var audioCapturer: AudioCapturer? = null
     private var isStreaming = false
-    private var discoverySocket: DatagramSocket? = null
 
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
     private lateinit var tvStatus: TextView
     private lateinit var tvInfo: TextView
+    private lateinit var etIp: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -56,21 +40,23 @@ class MainActivity : AppCompatActivity() {
         btnStop = findViewById(R.id.btnStop)
         tvStatus = findViewById(R.id.tvStatus)
         tvInfo = findViewById(R.id.tvInfo)
+        etIp = findViewById(R.id.etIp)
 
         btnStop.isEnabled = false
+        tvInfo.text = getDeviceInfo()
 
         btnStart.setOnClickListener {
+            val ip = etIp.text.toString().trim()
+            if (ip.isEmpty()) {
+                tvStatus.text = "⚠️ Digite o IP da TV Box"
+                return@setOnClickListener
+            }
             requestScreenCapture()
         }
 
         btnStop.setOnClickListener {
             stopStreaming()
         }
-
-        // Start discovery broadcast listener
-        startDiscovery()
-
-        tvInfo.text = getDeviceInfo()
     }
 
     private fun getDeviceInfo(): String {
@@ -78,7 +64,7 @@ class MainActivity : AppCompatActivity() {
         val ip = intToIp(wm.connectionInfo.ipAddress)
         val dm = DisplayMetrics()
         windowManager.defaultDisplay.getRealMetrics(dm)
-        return "IP: $ip\nResolução: ${dm.widthPixels}x${dm.heightPixels}\nDPI: ${dm.densityDpi}\nAndroid: ${Build.VERSION.RELEASE}"
+        return "Seu IP: $ip\nResolução: ${dm.widthPixels}x${dm.heightPixels}\nAndroid: ${Build.VERSION.RELEASE}"
     }
 
     private fun intToIp(ip: Int): String {
@@ -95,7 +81,7 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == REQUEST_CODE_SCREEN_CAPTURE && resultCode == Activity.RESULT_OK && data != null) {
             startStreaming(resultCode, data)
         } else {
-            tvStatus.text = "Permissão negada"
+            tvStatus.text = "❌ Permissão negada"
         }
     }
 
@@ -109,18 +95,36 @@ class MainActivity : AppCompatActivity() {
         val height = dm.heightPixels
         val dpi = dm.densityDpi
 
-        screenEncoder = ScreenEncoder(mediaProjection!!, width, height, dpi, STREAM_PORT)
-        screenEncoder?.start()
+        val targetIp = etIp.text.toString().trim()
 
-        audioCapturer = AudioCapturer(AUDIO_PORT)
-        audioCapturer?.start()
+        tvStatus.text = "🔗 Conectando a $targetIp..."
 
-        isStreaming = true
-        runOnUiThread {
-            btnStart.isEnabled = false
-            btnStop.isEnabled = true
-            tvStatus.text = "📡 Transmitindo..."
-        }
+        // Start screen encoder (connects via TCP to receiver)
+        screenEncoder = ScreenEncoder(mediaProjection!!, width, height, dpi, targetIp, SERVER_PORT)
+        
+        // Start audio capturer (uses MediaProjection audio capture)
+        audioCapturer = AudioCapturer(mediaProjection!!, targetIp, SERVER_PORT + 1)
+
+        // Connect screen first, then audio
+        Thread {
+            val connected = screenEncoder?.connect() ?: false
+            if (connected) {
+                screenEncoder?.start()
+                Thread.sleep(200)
+                audioCapturer?.connect()
+                audioCapturer?.start()
+                runOnUiThread {
+                    isStreaming = true
+                    btnStart.isEnabled = false
+                    btnStop.isEnabled = true
+                    tvStatus.text = "📡 Transmitindo para $targetIp"
+                }
+            } else {
+                runOnUiThread {
+                    tvStatus.text = "❌ Falha ao conectar. Verifique o IP."
+                }
+            }
+        }.start()
     }
 
     private fun stopStreaming() {
@@ -138,35 +142,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun startDiscovery() {
-        Thread {
-            try {
-                discoverySocket = DatagramSocket(DISCOVERY_PORT)
-                discoverySocket?.broadcast = true
-                val buffer = ByteArray(1024)
-                while (true) {
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    discoverySocket?.receive(packet)
-                    val message = String(packet.data, 0, packet.length)
-                    if (message == "SCREEN_MIRROR_DISCOVERY") {
-                        // Respond with our IP so receiver can connect
-                        val response = "SCREEN_MIRROR_SENDER".toByteArray()
-                        val responsePacket = DatagramPacket(
-                            response, response.size,
-                            packet.address, packet.port
-                        )
-                        discoverySocket?.send(responsePacket)
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }.start()
-    }
-
     override fun onDestroy() {
         super.onDestroy()
         stopStreaming()
-        discoverySocket?.close()
     }
 }
