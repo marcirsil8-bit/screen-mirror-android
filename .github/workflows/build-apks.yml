@@ -27,16 +27,13 @@ jobs:
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v3
     
-    - name: Grant execute permission for gradlew
-      run: chmod +x sender/gradlew receiver/gradlew
-    
     - name: Build Sender APK
       working-directory: sender
-      run: gradle assembleDebug --no-daemon -x lint
+      run: gradle assembleDebug --no-daemon
     
     - name: Build Receiver APK
       working-directory: receiver
-      run: gradle assembleDebug --no-daemon -x lint
+      run: gradle assembleDebug --no-daemon
     
     - name: Upload Sender APK
       uses: actions/upload-artifact@v4
